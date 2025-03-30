@@ -16,12 +16,15 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Serve the "downloads" folder as static, so we can access final files:
 const downloadsDir = path.join(__dirname, 'downloads');
 if (!fs.existsSync(downloadsDir)) {
   fs.mkdirSync(downloadsDir);
 }
-app.use('/downloads', express.static(downloadsDir));
+app.use(
+  '/downloads',
+  cors(), 
+  express.static(downloadsDir)
+);
 
 // Available sizes for "resolution"
 const imageSizesDict = {
