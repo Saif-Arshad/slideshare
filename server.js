@@ -22,7 +22,10 @@ if (!fs.existsSync(downloadsDir)) {
 }
 app.use(
   '/downloads',
-  cors(), 
+  (req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    next();
+  },
   express.static(downloadsDir)
 );
 
