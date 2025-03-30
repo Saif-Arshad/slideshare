@@ -24,6 +24,7 @@ app.use(
   '/downloads',
   (req, res, next) => {
     res.header('Access-Control-Allow-Origin', '*');
+    res.header('Referrer-Policy', 'no-referrer'); // Added to override strict-origin-when-cross-origin
     next();
   },
   express.static(downloadsDir)
