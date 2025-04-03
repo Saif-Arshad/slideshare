@@ -26,6 +26,7 @@ if (!fs.existsSync(downloadsDir)) {
 
 // Serve files dynamically instead of using express.static
 app.get('/downloads/:filename', (req, res) => {
+  console.log("🚀 ~ app.get ~ req:", req.params)
   const filename = req.params.filename;
   const filePath = path.join(downloadsDir, filename);
 
