@@ -13,7 +13,7 @@ const AdmZip = require('adm-zip');
 
 const app = express();
 
-// 1) Load environment variables
+// 1) Environment variables
 const PORT = process.env.PORT || 4000;
 const baseUrl = process.env.BASE_URL || `http://localhost:${PORT}`;
 
@@ -26,13 +26,13 @@ app.use(cors({
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// 3) A folder to hold final downloadable files
+// 3) Directory for final downloadable files
 const downloadsDir = path.join(__dirname, 'downloads');
 if (!fs.existsSync(downloadsDir)) {
   fs.mkdirSync(downloadsDir);
 }
 
-// 4) Serve the final file from GET /downloads/:filename
+// 4) Serve files from /downloads/:filename
 app.get('/downloads/:filename', (req, res) => {
   const filename = req.params.filename;
   const filePath = path.join(downloadsDir, filename);
@@ -41,7 +41,7 @@ app.get('/downloads/:filename', (req, res) => {
     return res.status(404).json({ error: 'File not found' });
   }
 
-  // Set appropriate headers
+  // Send correct headers
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Referrer-Policy', 'no-referrer');
@@ -61,11 +61,11 @@ app.get('/downloads/:filename', (req, res) => {
       res.setHeader('Content-Type', 'application/octet-stream');
   }
 
-  // Pipe the file
+  // Stream the file
   const fileStream = fs.createReadStream(filePath);
   fileStream.pipe(res);
 
-  // Clean up the file after 3 minutes
+  // Cleanup after 3 minutes
   setTimeout(() => {
     if (fs.existsSync(filePath)) {
       fs.unlink(filePath, (err) => {
@@ -75,7 +75,7 @@ app.get('/downloads/:filename', (req, res) => {
   }, 3 * 60 * 1000);
 });
 
-// 5) Dictionary of possible image sizes for SlideShare
+// 5) Image sizes dictionary
 const imageSizesDict = {
   '320': { quality: 85, width: 320 },
   '638': { quality: 85, width: 638 },
@@ -84,7 +84,7 @@ const imageSizesDict = {
 
 /**
  * 6) /api/get-slides
- *    Scrapes the SlideShare page and finds the array of preview images
+ *    Scrapes the SlideShare page for the preview slides
  */
 app.post('/api/get-slides', async (req, res) => {
   try {
@@ -93,12 +93,12 @@ app.post('/api/get-slides', async (req, res) => {
       return res.status(400).json({ error: 'No SlideShare URL provided.' });
     }
 
-    // Fetch the SlideShare HTML
+    // Load SlideShare HTML
     const response = await axios.get(slideshareUrl);
     const html = response.data;
     const $ = cheerio.load(html);
 
-    // Find the __NEXT_DATA__ script
+    // Find __NEXT_DATA__ JSON
     let nextDataScript = null;
     $('script').each((i, script) => {
       if ($(script).attr('id') === '__NEXT_DATA__') {
@@ -106,9 +106,7 @@ app.post('/api/get-slides', async (req, res) => {
       }
     });
     if (!nextDataScript) {
-      return res.status(404).json({
-        error: 'Could not find __NEXT_DATA__ script tag on that SlideShare page.'
-      });
+      return res.status(404).json({ error: 'Could not find __NEXT_DATA__ script on that page.' });
     }
 
     const jsonData = JSON.parse(nextDataScript);
@@ -116,13 +114,12 @@ app.post('/api/get-slides', async (req, res) => {
     const slideshow = props?.slideshow || {};
     const slides = slideshow?.slides || {};
 
-    // Basic info
     const totalSlides = slideshow.totalSlides || 0;
     const imageLocation = slides.imageLocation || '';
     const imageTitle = slides.title || '';
     const host = slides.host || '';
 
-    // Build preview URLs using the low-res "320" preset
+    // Build low-res preview URLs
     const { width: previewWidth, quality: previewQuality } = imageSizesDict['320'];
     const slideImagesPreview = [];
     for (let i = 1; i <= totalSlides; i++) {
@@ -130,7 +127,6 @@ app.post('/api/get-slides', async (req, res) => {
       slideImagesPreview.push(url);
     }
 
-    // Return them to the client
     return res.json({
       totalSlides,
       slideImagesPreview,
@@ -144,12 +140,11 @@ app.post('/api/get-slides', async (req, res) => {
 
 /**
  * 7) /api/generate-file
- *    Download each selected slide in the chosen resolution,
- *    forcibly convert to a known format (JPEG or PNG),
- *    then build final PDF / PPTX / ZIP output.
+ *    Downloads selected slides in chosen resolution, then
+ *    builds final PDF/PPTX/ZIP. Download is done in parallel.
  */
 app.post('/api/generate-file', async (req, res) => {
-  let downloadedFiles = []; // For cleanup if something goes wrong
+  let downloadedFiles = []; // keep track for cleanup on error
 
   try {
     const { slideshowInfo, resolution, outputFormat, selectedIndices } = req.body;
@@ -168,71 +163,64 @@ app.post('/api/generate-file', async (req, res) => {
     }
     const { width, quality } = sizeEntry;
 
-    // Build final image URLs
+    // Build final array of slide URLs
     const slideImagesFinal = selectedIndices.map((idx) => {
-      const realSlideNum = idx + 1; // user slides are 0-based in array
+      const realSlideNum = idx + 1; // user slides are 0-based
       return `${host}/${imageLocation}/${quality}/${imageTitle}-${realSlideNum}-${width}.jpg`;
     });
 
-    // We'll store them in a temp folder
+    // Folder for temp images
     const tempFolder = path.join(__dirname, 'temp_slides');
     if (!fs.existsSync(tempFolder)) {
       fs.mkdirSync(tempFolder, { recursive: true });
     }
 
-    // For PDFKit or PPTX, we typically want .jpg or .png
-    // We'll convert everything to the user's desired format:
-    // - If user wants "png", then we'll store as PNG.
-    // - Otherwise, we'll store as JPEG (pdf, pptx, zip, jpg => all become .jpg).
+    // Decide final file format for images
+    // If user asked "png", we store slides as .png. Otherwise .jpg
     const wantsPng = (outputFormat.toLowerCase() === 'png');
 
-    // 8) Download each slide, forcibly convert format with Sharp
-    for (let i = 0; i < slideImagesFinal.length; i++) {
-      const imgUrl = slideImagesFinal[i];
+    // 8) Parallel download + convert
+    await Promise.all(
+      slideImagesFinal.map(async (imgUrl, i) => {
+        const ext = wantsPng ? 'png' : 'jpg';
+        const filename = `slide_${i}.${ext}`;
+        const filepath = path.join(tempFolder, filename);
 
-      // Decide on extension for the local file
-      const ext = wantsPng ? 'png' : 'jpg';
-      const filename = `slide_${i}.${ext}`;
-      const filepath = path.join(tempFolder, filename);
+        // Download raw arraybuffer
+        const response = await axios.get(imgUrl, { responseType: 'arraybuffer' });
+        if (response.status !== 200) {
+          throw new Error(`Failed to download image #${i}: HTTP ${response.status}`);
+        }
+        const originalBuffer = Buffer.from(response.data);
 
-      // Download raw arraybuffer
-      const response = await axios.get(imgUrl, { responseType: 'arraybuffer' });
-      if (response.status !== 200) {
-        throw new Error(`Failed to download image: HTTP ${response.status}`);
-      }
-      const originalBuffer = Buffer.from(response.data);
+        // Convert to desired format using Sharp
+        let finalBuffer;
+        if (wantsPng) {
+          finalBuffer = await sharp(originalBuffer).png().toBuffer();
+        } else {
+          finalBuffer = await sharp(originalBuffer).jpeg().toBuffer();
+        }
 
-      // Convert buffer to the correct format with Sharp
-      let finalBuffer;
-      if (wantsPng) {
-        finalBuffer = await sharp(originalBuffer).png().toBuffer();
-      } else {
-        finalBuffer = await sharp(originalBuffer).jpeg().toBuffer();
-      }
+        fs.writeFileSync(filepath, finalBuffer);
+        downloadedFiles.push(filepath);
+      })
+    );
 
-      // Save that standardized image
-      fs.writeFileSync(filepath, finalBuffer);
-      downloadedFiles.push(filepath);
-    }
-
-    // 9) Build the final file
-    //    If user asked for "jpg" or "png" specifically, we actually zip them up anyway.
-    //    Because we only return a single link to download everything.
+    // 9) Build final file
     let finalExt = outputFormat.toLowerCase();
     if (finalExt === 'jpg' || finalExt === 'png') {
-      // We'll do a .zip so all images are in one file
+      // We'll do a .zip so there's a single download link
       finalExt = 'zip';
     }
 
     const finalFilename = `slides_${Date.now()}.${finalExt}`;
     const finalFilePath = path.join(downloadsDir, finalFilename);
 
-    // Switch on the chosen output
     switch (outputFormat.toLowerCase()) {
       case 'jpg':
       case 'png':
       case 'zip': {
-        // Just zip up the images (which are all either .jpg or .png)
+        // Zip up all the images
         const zip = new AdmZip();
         for (const file of downloadedFiles) {
           zip.addLocalFile(file);
@@ -242,7 +230,7 @@ app.post('/api/generate-file', async (req, res) => {
       }
 
       case 'pdf': {
-        // Create a PDF with each image as a page
+        // Build a PDF: each image -> new page
         const pdfDoc = new PDFDocument({ autoFirstPage: false });
         const writeStream = fs.createWriteStream(finalFilePath);
         pdfDoc.pipe(writeStream);
@@ -254,23 +242,21 @@ app.post('/api/generate-file', async (req, res) => {
         }
         pdfDoc.end();
 
-        // Wait for the PDF to be fully written
         await new Promise((resolve) => writeStream.on('finish', resolve));
         break;
       }
 
       case 'pptx': {
-        // Create a PPTX, each slide is one image
+        // Build a PPTX: each slide -> one full-image slide
         const pptx = new PptxGenJS();
         for (const file of downloadedFiles) {
           const slide = pptx.addSlide();
           const fileBuffer = fs.readFileSync(file);
           const b64 = fileBuffer.toString('base64');
 
-          // If we used PNG, the data type is image/png; else image/jpeg
           slide.addImage({
             data: `data:image/${wantsPng ? 'png' : 'jpeg'};base64,${b64}`,
-            x: 0, y: 0, w: '100%', h: '100%'
+            x: 0, y: 0, w: '100%', h: '100%',
           });
         }
         const b64pptx = await pptx.write('base64');
@@ -280,29 +266,25 @@ app.post('/api/generate-file', async (req, res) => {
       }
 
       default:
-        // Unknown format, cleanup and bail
         cleanupTempFiles(downloadedFiles);
         return res.status(400).json({ error: `Invalid output format: ${outputFormat}` });
     }
 
-    // 10) Cleanup the temp images
+    // 10) Remove temp images
     cleanupTempFiles(downloadedFiles);
 
-    // 11) Respond with a direct download URL
+    // 11) Return a direct download URL
     const downloadUrl = `${baseUrl}/downloads/${finalFilename}`;
     return res.json({ downloadUrl });
   } catch (err) {
     console.error('Error in /api/generate-file:', err);
-    // Cleanup any partial downloads if we crashed
     cleanupTempFiles(downloadedFiles);
     return res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * Utility to remove the downloaded temp images
- */
-function cleanupTempFiles(files) {  
+// Utility function to remove temp files
+function cleanupTempFiles(files) {
   for (const filePath of files) {
     if (fs.existsSync(filePath)) {
       fs.unlinkSync(filePath);
