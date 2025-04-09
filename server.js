@@ -10,6 +10,10 @@ const sharp = require('sharp');
 const PDFDocument = require('pdfkit');
 const PptxGenJS = require('pptxgenjs');
 const AdmZip = require('adm-zip');
+let pLimit;
+(async () => {
+  pLimit = (await import('p-limit')).default;
+})();
 
 const app = express();
 
@@ -41,7 +45,6 @@ app.get('/downloads/:filename', (req, res) => {
     return res.status(404).json({ error: 'File not found' });
   }
 
-  // Send correct headers
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Referrer-Policy', 'no-referrer');
@@ -61,11 +64,9 @@ app.get('/downloads/:filename', (req, res) => {
       res.setHeader('Content-Type', 'application/octet-stream');
   }
 
-  // Stream the file
   const fileStream = fs.createReadStream(filePath);
   fileStream.pipe(res);
 
-  // Cleanup after 3 minutes
   setTimeout(() => {
     if (fs.existsSync(filePath)) {
       fs.unlink(filePath, (err) => {
@@ -82,10 +83,7 @@ const imageSizesDict = {
   '2048': { quality: 75, width: 2048 },
 };
 
-/**
- * 6) /api/get-slides
- *    Scrapes the SlideShare page for the preview slides
- */
+// 6) /api/get-slides
 app.post('/api/get-slides', async (req, res) => {
   try {
     const { slideshareUrl } = req.body;
@@ -93,12 +91,10 @@ app.post('/api/get-slides', async (req, res) => {
       return res.status(400).json({ error: 'No SlideShare URL provided.' });
     }
 
-    // Load SlideShare HTML
     const response = await axios.get(slideshareUrl);
     const html = response.data;
     const $ = cheerio.load(html);
 
-    // Find __NEXT_DATA__ JSON
     let nextDataScript = null;
     $('script').each((i, script) => {
       if ($(script).attr('id') === '__NEXT_DATA__') {
@@ -119,7 +115,6 @@ app.post('/api/get-slides', async (req, res) => {
     const imageTitle = slides.title || '';
     const host = slides.host || '';
 
-    // Build low-res preview URLs
     const { width: previewWidth, quality: previewQuality } = imageSizesDict['320'];
     const slideImagesPreview = [];
     for (let i = 1; i <= totalSlides; i++) {
@@ -138,13 +133,9 @@ app.post('/api/get-slides', async (req, res) => {
   }
 });
 
-/**
- * 7) /api/generate-file
- *    Downloads selected slides in chosen resolution, then
- *    builds final PDF/PPTX/ZIP. Download is done in parallel.
- */
+// 7) /api/generate-file
 app.post('/api/generate-file', async (req, res) => {
-  let downloadedFiles = []; // keep track for cleanup on error
+  let downloadedFiles = [];
 
   try {
     const { slideshowInfo, resolution, outputFormat, selectedIndices } = req.body;
@@ -163,53 +154,63 @@ app.post('/api/generate-file', async (req, res) => {
     }
     const { width, quality } = sizeEntry;
 
-    // Build final array of slide URLs
     const slideImagesFinal = selectedIndices.map((idx) => {
-      const realSlideNum = idx + 1; // user slides are 0-based
+      const realSlideNum = idx + 1;
       return `${host}/${imageLocation}/${quality}/${imageTitle}-${realSlideNum}-${width}.jpg`;
     });
 
-    // Folder for temp images
     const tempFolder = path.join(__dirname, 'temp_slides');
     if (!fs.existsSync(tempFolder)) {
       fs.mkdirSync(tempFolder, { recursive: true });
     }
 
-    // Decide final file format for images
-    // If user asked "png", we store slides as .png. Otherwise .jpg
     const wantsPng = (outputFormat.toLowerCase() === 'png');
 
-    // 8) Parallel download + convert
+    // 8) Download with concurrency limit, retries, and increased timeout
+    const limit = pLimit(20); // Limit to 20 concurrent downloads
     await Promise.all(
-      slideImagesFinal.map(async (imgUrl, i) => {
+      slideImagesFinal.map((imgUrl, i) => limit(async () => {
         const ext = wantsPng ? 'png' : 'jpg';
         const filename = `slide_${i}.${ext}`;
         const filepath = path.join(tempFolder, filename);
 
-        // Download raw arraybuffer
-        const response = await axios.get(imgUrl, { responseType: 'arraybuffer' });
-        if (response.status !== 200) {
-          throw new Error(`Failed to download image #${i}: HTTP ${response.status}`);
-        }
-        const originalBuffer = Buffer.from(response.data);
+        let attempts = 0;
+        const maxRetries = 3;
+        while (attempts < maxRetries) {
+          try {
+            const response = await axios.get(imgUrl, {
+              responseType: 'arraybuffer',
+              timeout: 30000 // 30 seconds timeout
+            });
+            if (response.status !== 200) {
+              throw new Error(`Failed to download image #${i}: HTTP ${response.status}`);
+            }
+            const originalBuffer = Buffer.from(response.data);
 
-        // Convert to desired format using Sharp
-        let finalBuffer;
-        if (wantsPng) {
-          finalBuffer = await sharp(originalBuffer).png().toBuffer();
-        } else {
-          finalBuffer = await sharp(originalBuffer).jpeg().toBuffer();
-        }
+            let finalBuffer;
+            if (wantsPng) {
+              finalBuffer = await sharp(originalBuffer).png().toBuffer();
+            } else {
+              finalBuffer = await sharp(originalBuffer).jpeg().toBuffer();
+            }
 
-        fs.writeFileSync(filepath, finalBuffer);
-        downloadedFiles.push(filepath);
-      })
+            fs.writeFileSync(filepath, finalBuffer);
+            downloadedFiles.push(filepath);
+            return; // Success, exit retry loop
+          } catch (err) {
+            attempts++;
+            if (attempts >= maxRetries) {
+              throw new Error(`Failed to download ${imgUrl} after ${maxRetries} attempts: ${err.message}`);
+            }
+            await new Promise(resolve => setTimeout(resolve, 1000 * attempts)); // Exponential backoff
+          }
+        }
+      }))
     );
 
     // 9) Build final file
     let finalExt = outputFormat.toLowerCase();
     if (finalExt === 'jpg' || finalExt === 'png') {
-      // We'll do a .zip so there's a single download link
       finalExt = 'zip';
     }
 
@@ -220,7 +221,6 @@ app.post('/api/generate-file', async (req, res) => {
       case 'jpg':
       case 'png':
       case 'zip': {
-        // Zip up all the images
         const zip = new AdmZip();
         for (const file of downloadedFiles) {
           zip.addLocalFile(file);
@@ -228,9 +228,7 @@ app.post('/api/generate-file', async (req, res) => {
         fs.writeFileSync(finalFilePath, zip.toBuffer());
         break;
       }
-
       case 'pdf': {
-        // Build a PDF: each image -> new page
         const pdfDoc = new PDFDocument({ autoFirstPage: false });
         const writeStream = fs.createWriteStream(finalFilePath);
         pdfDoc.pipe(writeStream);
@@ -241,19 +239,15 @@ app.post('/api/generate-file', async (req, res) => {
           pdfDoc.image(image, 0, 0);
         }
         pdfDoc.end();
-
         await new Promise((resolve) => writeStream.on('finish', resolve));
         break;
       }
-
       case 'pptx': {
-        // Build a PPTX: each slide -> one full-image slide
         const pptx = new PptxGenJS();
         for (const file of downloadedFiles) {
           const slide = pptx.addSlide();
           const fileBuffer = fs.readFileSync(file);
           const b64 = fileBuffer.toString('base64');
-
           slide.addImage({
             data: `data:image/${wantsPng ? 'png' : 'jpeg'};base64,${b64}`,
             x: 0, y: 0, w: '100%', h: '100%',
@@ -264,16 +258,15 @@ app.post('/api/generate-file', async (req, res) => {
         fs.writeFileSync(finalFilePath, pptxBuffer);
         break;
       }
-
       default:
         cleanupTempFiles(downloadedFiles);
         return res.status(400).json({ error: `Invalid output format: ${outputFormat}` });
     }
 
-    // 10) Remove temp images
+    // 10) Cleanup temp files
     cleanupTempFiles(downloadedFiles);
 
-    // 11) Return a direct download URL
+    // 11) Return download URL
     const downloadUrl = `${baseUrl}/downloads/${finalFilename}`;
     return res.json({ downloadUrl });
   } catch (err) {
@@ -292,7 +285,6 @@ function cleanupTempFiles(files) {
   }
 }
 
-// Start the server
 app.listen(PORT, () => {
   console.log(`Server listening on port ${PORT}`);
 });
